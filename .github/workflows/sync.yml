@@ -1,0 +1,115 @@
+name: Sync Upstream and Deploy to CF Worker
+
+on:
+  schedule:
+    - cron: "34 4 * * *"   # 北京时间 每天12:34
+  workflow_dispatch:       # 可手动触发
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          set -e
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/byJoey/cfnew.git
+          git fetch upstream main
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          set -e
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/main)
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "✅ No new commits from upstream."
+            echo "upstream_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "⬆️ Found new commits, syncing..."
+            echo "upstream_changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync upstream changes (safe file backup)
+        if: steps.check.outputs.upstream_changed == 'true'
+        run: |
+          set -e
+          echo "🔄 Syncing upstream changes but keeping local workflows..."
+          
+          git fetch upstream main
+          git checkout main
+          
+          # 临时备份 workflow
+          mkdir -p /tmp/workflows_backup
+          cp -r .github/workflows/* /tmp/workflows_backup/ || true
+          
+          git reset --hard upstream/main
+          
+          # 恢复 workflow
+          mkdir -p .github/workflows
+          cp -r /tmp/workflows_backup/* .github/workflows/ || true
+          
+          git add .github/workflows || true
+          git commit -m "Preserve local workflows after upstream sync" || true
+
+      - name: Push changes back to fork
+        if: steps.check.outputs.upstream_changed == 'true'
+        run: |
+          set -e
+          echo "⚙️ Forcing push to fork..."
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git main --force
+
+      - name: Deploy to Cloudflare Worker
+        if: steps.check.outputs.upstream_changed == 'true'
+        run: |
+          set -e
+          FILE_PATH="少年你相信光吗"
+
+          if [ ! -f "$FILE_PATH" ]; then
+            echo "❌ Source file not found: $FILE_PATH"
+            exit 1
+          fi
+
+          echo "✅ Found source file: $FILE_PATH"
+          
+          cp "$FILE_PATH" index.js
+          
+          # 创建包含 KV 绑定和环境变量的 wrangler.toml
+          cat > wrangler.toml <<EOF
+          name = "${{ secrets.CF_WORKER_NAME }}"
+          main = "index.js"
+          compatibility_date = "$(date +%Y-%m-%d)"
+          account_id = "${{ secrets.CF_ACCOUNT_ID }}"
+
+          # KV 命名空间绑定
+          [[kv_namespaces]]
+          binding = "C"               # KV 绑定变量名称
+          id = "${{ vars.FREE_KV_ID }}"  # KV 命名空间 ID
+
+          # 环境变量
+          [vars]
+          u = "${{ vars.u }}"
+          ev = "yes"  # 启用 vless
+          et = "yes"  # 启用 trojan
+          ex = "yes"  # 启动 xhttp
+          EOF
+
+          echo "🚀 Deploying to Cloudflare Worker..."
+          npx wrangler deploy --no-bundle
+          
+          rm index.js wrangler.toml
+          echo "✅ Deployment complete."
+
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
